@@ -130,15 +130,73 @@ install_wireguard_packages() {
 }
 
 _load_wg_module() {
-    if ! modprobe wireguard 2>/dev/null; then
-        warn "Модуль не загрузился, пробуем kernel-devel..."
+    if modprobe wireguard 2>/dev/null; then
+        echo "wireguard" > /etc/modules-load.d/wireguard.conf
+        ok "Модуль wireguard загружен."
+        return 0
+    fi
+
+    # Модуль недоступен — проверяем контейнерную среду
+    local virt; virt=$(systemd-detect-virt 2>/dev/null)
+    if [[ "$virt" == "openvz" || "$virt" == "lxc" || "$virt" == "lxc-libvirt" ]]; then
+        warn "Обнаружена контейнерная среда (${virt}) — ядерный модуль недоступен."
+        warn "Переключаемся на BoringTun (userspace WireGuard)..."
+        _install_boringtun
+    else
+        # Не контейнер — пробуем kernel-devel (актуально для CentOS Stream 8)
+        warn "Модуль не загрузился, пробуем пересобрать через kernel-devel..."
         dnf install -y "kernel-devel-$(uname -r)" 2>/dev/null \
             || dnf install -y kernel-devel 2>/dev/null || true
         depmod -a
         modprobe wireguard || { err "Не удалось загрузить модуль wireguard."; exit 1; }
+        echo "wireguard" > /etc/modules-load.d/wireguard.conf
+        ok "Модуль wireguard загружен."
     fi
-    echo "wireguard" > /etc/modules-load.d/wireguard.conf
-    ok "Модуль wireguard загружен."
+}
+
+_install_boringtun() {
+    # Проверяем TUN-устройство — без него BoringTun не работает
+    if [[ ! -e /dev/net/tun ]]; then
+        err "TUN-устройство недоступно (/dev/net/tun не найден)."
+        err "Попросите хостера включить TUN или модуль wireguard для контейнера."
+        exit 1
+    fi
+
+    # Проверяем что boringtun уже установлен
+    if command -v boringtun &>/dev/null; then
+        ok "BoringTun уже установлен: $(boringtun --version)"
+    else
+        info "Скачиваем BoringTun..."
+        local url="https://github.com/robvanoostenrijk/boringtun-static/releases/download/v0.5.2/boringtun-cli-0.5.2-x86_64-unknown-linux-musl.tar.xz"
+        local tmp; tmp=$(mktemp -d)
+
+        if ! { wget -qO "${tmp}/bt.tar.xz" "$url" 2>/dev/null \
+               || curl -Lo "${tmp}/bt.tar.xz" "$url" 2>/dev/null; }; then
+            err "Не удалось скачать BoringTun."
+            err "Скачайте вручную и положите бинарник в /usr/local/sbin/boringtun"
+            err "  ${url}"
+            exit 1
+        fi
+
+        tar -xf "${tmp}/bt.tar.xz" -C "${tmp}"
+        local binary; binary=$(find "$tmp" -type f -executable ! -name "*.tar*" | head -1)
+        [[ -z "$binary" ]] && { err "Бинарник не найден в архиве."; exit 1; }
+
+        cp "$binary" /usr/local/sbin/boringtun
+        chmod +x /usr/local/sbin/boringtun
+        rm -rf "$tmp"
+        ok "BoringTun установлен: $(boringtun --version)"
+    fi
+
+    # Настраиваем wg-quick для использования BoringTun
+    mkdir -p /etc/systemd/system/wg-quick@wg0.service.d/
+    cat > /etc/systemd/system/wg-quick@wg0.service.d/boringtun.conf << 'EOF'
+[Service]
+Environment=WG_QUICK_USERSPACE_IMPLEMENTATION=boringtun
+Environment=WG_SUDO=1
+EOF
+    systemctl daemon-reload
+    ok "wg-quick настроен на использование BoringTun."
 }
 
 _fix_centos8_repos() {
@@ -295,9 +353,10 @@ setup_relay() {
     read -p "  Имя этого узла [relay]: " node_name
     [[ -z "$node_name" ]] && node_name="relay"
 
+    local os_short="${os_pretty:0:32}"
     echo
     echo "  ┌────────────────────────────────────────┐"
-    printf "  │  %-38s│\n" "ОС    : ${os_pretty}"
+    printf "  │  %-38s│\n" "ОС    : ${os_short}"
     printf "  │  %-38s│\n" "Роль  : relay"
     printf "  │  %-38s│\n" "Адрес : ${wg_addr}"
     printf "  │  %-38s│\n" "Порт  : ${wg_port}"
@@ -421,9 +480,10 @@ setup_nat() {
     read -p "  Имя этого узла [node]: " node_name
     [[ -z "$node_name" ]] && node_name="node"
 
+    local os_short="${os_pretty:0:26}"
     echo
     echo "  ┌────────────────────────────────────────┐"
-    printf "  │  %-38s│\n" "ОС          : ${os_pretty}"
+    printf "  │  %-38s│\n" "ОС          : ${os_short}"
     printf "  │  %-38s│\n" "Роль        : NAT"
     printf "  │  %-38s│\n" "Адрес       : ${wg_addr}"
     printf "  │  %-38s│\n" "Порт        : ${wg_port}"
